@@ -1,3 +1,4 @@
+import os
 import whisper
 import sounddevice as sd
 from scipy.io.wavfile import write
@@ -5,6 +6,13 @@ import tempfile
 import pyttsx3
 import time
 import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+HF_API_KEY = os.getenv("HF_API_KEY")
+if not HF_API_KEY:
+    raise RuntimeError("HF_API_KEY is missing. Add it to your .env file (not committed).")
 
 MIC_INDEX = 2
 
@@ -13,7 +21,7 @@ model = whisper.load_model("base")
 # ✅ موديل مضمون يشتغل
 API_URL =  "https://router.huggingface.co/hf-inference/models/tiiuae/falcon-7b-instruct"
 headers = {
-    "Authorization": "Bearer [HF_TOKEN_REMOVED]",
+    "Authorization": f"Bearer {HF_API_KEY}",
     "Content-Type": "application/json"
 }
 
