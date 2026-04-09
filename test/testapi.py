@@ -26,11 +26,13 @@ except Exception:  # pragma: no cover
 
 # ---------------------------------------------------------------
 # Configuration
+
 # ---------------------------------------------------------------
 ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 load_dotenv(ENV_PATH)
 HF_API_KEY = os.getenv("HF_API_KEY")
 MIC_DEVICE = os.getenv("MIC_DEVICE")  # optional: device name substring or index
+
 
 # Models chosen to be small and free via Hugging Face Inference API
 STT_MODEL = "openai/whisper-large-v3"  # router-supported; raw audio/wav (HF fallback)
