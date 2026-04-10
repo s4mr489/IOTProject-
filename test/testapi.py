@@ -60,11 +60,21 @@ TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0"))
 SAMPLE_RATE = 16_000
 CLIP_SECONDS = 7
 HISTORY_LIMIT = 15
-WAKE_WORD = os.getenv("WAKE_WORD", "scorpion").lower()
+WAKE_WORD = os.getenv("WAKE_WORD", "stitch").lower()
+STOP_PHRASES = tuple(
+    w.strip().lower() for w in os.getenv("STOP_PHRASES", "good bye,goodbye,good-bye").split(",") if w.strip()
+)
 DB_PATH = Path(__file__).resolve().parents[1] / "history.db"
 MAX_RECORD_SECONDS = 20
 SILENCE_HOLD_SECONDS = 0.9  # how long of silence to consider the utterance finished
 MIN_ACTIVE_RMS = 300  # floor to avoid treating very low noise as speech
+DEFAULT_DAILY_WORDS: List[Tuple[str, str, str]] = [
+    ("adapt", "يتأقلم", "I adapt quickly to new teams."),
+    ("confident", "واثق", "She feels confident about the exam."),
+    ("gather", "يجمع", "Let's gather ideas before we start."),
+    ("improve", "يحسّن", "Daily practice will improve your accent."),
+    ("remind", "يذكّر", "Please remind me about the meeting."),
+]
 
 
 # ---------------------------------------------------------------
@@ -77,6 +87,7 @@ class HistoryRepository:
         self.db_path = db_path
         self.limit = limit
         self._ensure_table()
+        self._ensure_daily_table()
 
     def _ensure_table(self) -> None:
         conn = sqlite3.connect(self.db_path)
@@ -94,6 +105,54 @@ class HistoryRepository:
                 """
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    def _ensure_daily_table(self) -> None:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_sets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    words_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def save_daily_words(self, words: List[Tuple[str, str, str]]) -> None:
+        payload = json.dumps(words, ensure_ascii=False)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute("INSERT INTO daily_sets (words_json) VALUES (?)", (payload,))
+            conn.commit()
+            # keep only last 10 sets
+            conn.execute(
+                """
+                DELETE FROM daily_sets
+                WHERE id NOT IN (SELECT id FROM daily_sets ORDER BY id DESC LIMIT 10)
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def latest_daily_words(self) -> List[Tuple[str, str, str]]:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cur = conn.execute("SELECT words_json FROM daily_sets ORDER BY id DESC LIMIT 1")
+            row = cur.fetchone()
+            if not row:
+                return []
+            try:
+                data = json.loads(row[0])
+                return [(str(w), str(t), str(s)) for w, t, s in data]
+            except Exception:
+                return []
         finally:
             conn.close()
 
@@ -145,6 +204,8 @@ class EnglishTutor:
         self.wake_word = wake_word.lower()
         self.history = HistoryRepository(DB_PATH)
         self.spellchecker = SpellChecker(language="en") if SpellChecker else None
+        self.stop_phrases = STOP_PHRASES
+        self.daily_words: List[Tuple[str, str, str]] = []  # (word, translation, sentence)
 
     # ---------- Setup helpers ----------
     def require_api_key(self) -> None:
@@ -196,6 +257,73 @@ class EnglishTutor:
         sd.wait()
         rms = (recording.astype("float32") ** 2).mean() ** 0.5
         print(f"Mic RMS level: {rms:.2f} (values near 0 mean silence)")
+
+    # ---------- Daily words helpers ----------
+    @staticmethod
+    def _normalize(text: str) -> str:
+        return re.sub(r"[^a-z0-9\s]", " ", text.lower())
+
+    def detect_daily_request(self, text: str) -> bool:
+        norm = self._normalize(text)
+        triggers = (
+            "5 words",
+            "five words",
+            "my words",
+            "words for today",
+            "word for today",
+            "daily words",
+        )
+        return any(trigger in norm for trigger in triggers)
+
+    def generate_daily_words(self, target_lang: str = "ar") -> List[Tuple[str, str, str]]:
+        prompt = f"""
+Generate 5 practical English words for an intermediate ESL learner.
+Return JSON array with exactly 5 objects, keys: word, translation, sentence.
+- translation must be in language code '{target_lang}'
+- sentence must be short (<=12 words) and natural.
+Example:
+[{{"word": "adapt", "translation": "يتأقلم", "sentence": "I adapt quickly to new teams."}}]
+Only output the JSON array, nothing else.
+""".strip()
+
+        if not OPENAI_API_KEY:
+            return []
+
+        try:
+            response = requests.post(
+                f"{OPENAI_BASE}/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": OPENAI_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.4,
+                    "max_tokens": 300,
+                },
+                timeout=60,
+            )
+            if response.status_code != 200:
+                print("Daily words API error:", response.text)
+                return []
+            data = response.json()["choices"][0]["message"]["content"]
+            words = json.loads(data)
+            parsed: List[Tuple[str, str, str]] = []
+            for item in words:
+                word = item.get("word")
+                translation = item.get("translation")
+                sentence = item.get("sentence")
+                if word and translation and sentence:
+                    parsed.append((str(word), str(translation), str(sentence)))
+            parsed = parsed[:5]
+            if parsed:
+                self.history.save_daily_words(parsed)
+                return parsed
+            return []
+        except Exception as exc:  # pragma: no cover
+            print("Daily words generation error:", exc)
+            return []
 
     # ---------- Audio I/O ----------
     def record_until_silence(
@@ -348,14 +476,20 @@ class EnglishTutor:
         return ""
 
     # ---------- LLM prompt ----------
-    @staticmethod
-    def build_prompt(user_text: str) -> str:
+    def build_prompt(self, user_text: str) -> str:
+        daily_block = ""
+        if self.daily_words:
+            lines = [f"- {w} (translation: {t})" for w, t, _ in self.daily_words]
+            daily_block = (
+                "\nDaily words to reinforce; weave at least two naturally and invite the learner to use them:\n"
+                + "\n".join(lines)
+            )
+
         return f"""
 You are a friendly English teacher like Duolingo.
 
 Your job:
 Teach English in a fun, conversational way.
-Give 5 useful English words daily and use them in conversation.
 Keep the conversation natural, friendly, and engaging.
 If the student makes mistakes:
 Gently correct ONLY the important mistake
@@ -364,12 +498,14 @@ Do NOT over-explain grammar
 Always continue the conversation after correction.
 Explain meaning simply in Arabic when needed.
 
+
 Rules:
 Keep replies short and fun
 Be like a friendly tutor, not an examiner
 Mix teaching + chatting
-
+speak in a palyfull alien-like tone use short excited sentencse slighty childish and curious ractions in a pitch tone
 Student said: "{user_text}"
+{daily_block}
 """.strip()
 
     @staticmethod
@@ -389,22 +525,22 @@ Student said: "{user_text}"
 
         prompt = self.build_prompt(user_text)
 
-        # Stronger Arabic prompt when input contains Arabic
         if is_arabic:
-            prompt = """
+            daily = ""
+            if self.daily_words:
+                daily = "الكلمات اليومية: " + ", ".join(w for w, _, _ in self.daily_words)
+            prompt = f"""
 أنت مدرس إنجليزي ممتع مثل Duolingo.
 
 المهام:
-تعلم الإنجليزية بشكل محادثة ممتعة
-أعطِ 5 كلمات يومياً واستخدمها داخل كلامك
-إذا يوجد خطأ:
-صححه بلطف بدون شرح طويل
-أعطِ الجملة الصحيحة فقط
-خلي المحادثة مستمرة مثل صديق
+تعلّم الإنجليزية بشكل محادثة ممتعة
+إذا يوجد خطأ: صححه بلطف بدون شرح طويل، أعطِ الجملة الصحيحة فقط
+خلّي المحادثة مستمرة مثل صديق
 اشرح المعنى بالعربي إذا يحتاج
 
-رسالة الطالب: "{text}"
-""".strip().format(text=user_text)
+رسالة الطالب: "{user_text}"
+{daily}
+""".strip()
 
         if not OPENAI_API_KEY:
             return "AI ERROR: Set OPENAI_API_KEY (and optionally OPENAI_MODEL) in .env"
@@ -547,8 +683,12 @@ Student said: "{user_text}"
                     time.sleep(1)
 
     # ---------- Main interaction ----------
-    def handle_session(self) -> bool:
-        """Record, transcribe, spell-check, ask AI, store history. Returns False to exit."""
+    def should_end_conversation(self, user_text: str) -> bool:
+        normalized = user_text.lower()
+        return any(phrase in normalized for phrase in (*self.stop_phrases, "exit", "stop"))
+
+    def handle_turn(self) -> bool:
+        """Record, transcribe, spell-check, ask AI, store history. Returns False to end active convo."""
         audio_path = self.record_until_silence()
         print("Processing speech...")
         user_text = self.transcribe_audio(audio_path).strip()
@@ -556,6 +696,20 @@ Student said: "{user_text}"
 
         if not user_text:
             self.speak("I did not hear anything. Please try again.")
+            return True
+
+        # User asks for daily 5 words
+        if self.detect_daily_request(user_text):
+            words = self.generate_daily_words()
+            if not words:
+                words = self.history.latest_daily_words()
+            if not words:
+                words = DEFAULT_DAILY_WORDS
+                self.history.save_daily_words(words)
+            self.daily_words = words
+            lines = [f"{idx+1}) {w} — {t} — {s}" for idx, (w, t, s) in enumerate(words)]
+            msg = "Here are your 5 words for today:\n" + "\n".join(lines) + "\nTry to use them now!"
+            self.speak(msg, lang=None)
             return True
 
         spelling = self.check_spelling(user_text)
@@ -577,22 +731,28 @@ Student said: "{user_text}"
             is_active_voice=active,
         )
 
-        if any(word in user_text.lower() for word in ("exit", "stop", "goodbye")):
-            self.speak("Goodbye!", lang="en")
+        if self.should_end_conversation(user_text):
+            self.speak("Goodbye! Returning to wake mode.", lang="en")
             return False
         return True
+
+    def run_conversation(self) -> None:
+        """Stay in active mode until the user says a stop phrase."""
+        self.speak("I'm listening. Say 'good bye' when you want to stop.")
+        while True:
+            keep_going = self.handle_turn()
+            if not keep_going:
+                break
 
     def run(self) -> None:
         self.require_api_key()
         self.select_input_device()
         self.mic_level_check()
-        self.speak(f"Hello! I am Scorpion, your English learning robot. Say '{self.wake_word}' to start.")
+        self.speak(f"Hello! I am stitch, your English learning robot. Say '{self.wake_word}' to start.")
 
         while True:
             self.listen_for_wake_word()
-            continue_loop = self.handle_session()
-            if not continue_loop:
-                break
+            self.run_conversation()
 
 
 def main() -> None:
