@@ -7,10 +7,10 @@ __pycache__/
 *.py[cod]
 *.log
 
-# Virtual environments
-.venv/
-venv/
-ENV/
+# # Virtual environments
+# .venv/
+# venv/
+# ENV/
 
 # OS junk
 .DS_Store
