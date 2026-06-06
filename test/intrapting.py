@@ -57,16 +57,67 @@ except Exception:
 # ---------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-ENV_PATH = PROJECT_ROOT / ".env"
-load_dotenv(ENV_PATH)
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+
+
+def _find_env_path() -> Optional[Path]:
+    """Find .env reliably on Windows and Raspberry Pi.
+
+    Search order:
+    1) ENV_PATH variable if provided
+    2) Same folder as this Python file
+    3) Parent project folder
+    4) Current terminal folder
+    5) A common ./test folder from the current terminal
+    """
+    candidates: List[Path] = []
+
+    explicit = os.getenv("ENV_PATH")
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+
+    candidates.extend(
+        [
+            SCRIPT_DIR / ".env",
+            PROJECT_ROOT / ".env",
+            Path.cwd() / ".env",
+            Path.cwd() / "test" / ".env",
+        ]
+    )
+
+    seen = set()
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_environment(override: bool = False) -> Optional[Path]:
+    """Load .env and refresh API-related globals."""
+    env_path = _find_env_path()
+    if env_path:
+        load_dotenv(env_path, override=override)
+        print(f"[ENV] Loaded: {env_path}")
+    else:
+        # Still try python-dotenv default search as a fallback.
+        load_dotenv(override=override)
+        print("[ENV] No .env file found near this script. Using system environment variables only.")
+    return env_path
+
+
+ENV_PATH = load_environment()
 
 HF_API_KEY = os.getenv("HF_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_BASE = os.getenv("OPENAI_BASE", "https://api.openai.com")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-TTS_MODEL = os.getenv("TTS_MODEL", "tts-1-hd")
+TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")
 TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
 TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0"))
 
@@ -82,10 +133,16 @@ STOP_PHRASES = tuple(
     for w in os.getenv("STOP_PHRASES", "good bye,goodbye,good-bye").split(",")
     if w.strip()
 )
-DB_PATH = PROJECT_ROOT / "history.db"
+DB_PATH = Path(os.getenv("DB_PATH", str(PROJECT_ROOT / "history.db"))).expanduser()
 
 WAKE_RECORD_SECONDS = 2.0
-TURN_RECORD_SECONDS = 6.0
+TURN_RECORD_SECONDS = float(os.getenv("TURN_RECORD_SECONDS", "3.0"))
+
+# Barge-in lets the user interrupt the robot while it is speaking.
+BARGE_IN_ENABLED = os.getenv("BARGE_IN_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+BARGE_IN_RMS_THRESHOLD = float(os.getenv("BARGE_IN_RMS_THRESHOLD", "1800"))
+BARGE_IN_GRACE_SECONDS = float(os.getenv("BARGE_IN_GRACE_SECONDS", "0.8"))
+BARGE_IN_BLOCK_SECONDS = float(os.getenv("BARGE_IN_BLOCK_SECONDS", "0.12"))
 
 # ---------------------------------------------------------------
 # UI configuration
@@ -98,18 +155,39 @@ UI_FULLSCREEN = os.getenv("UI_FULLSCREEN", "1").strip().lower() not in {"0", "fa
 USER_WORD_DELAY_SECONDS = float(os.getenv("USER_WORD_DELAY_SECONDS", "0.22"))
 BOT_WORD_DELAY_SECONDS = float(os.getenv("BOT_WORD_DELAY_SECONDS", "0.26"))
 
-IDLE_GIF = os.getenv("IDLE_GIF", "")
-WAKE_GIF = os.getenv("WAKE_GIF", "")
-LISTEN_GIF = os.getenv("LISTEN_GIF", "")
-TALK_GIF = os.getenv("TALK_GIF", "")
-BYE_GIF = os.getenv("BYE_GIF", "")
+# The final Raspberry Pi structure should be:
+# /home/stitch/Robot/test/testo_final.py
+# /home/stitch/Robot/test/images/
+IMAGES_DIR = Path(os.getenv("IMAGES_DIR", str(SCRIPT_DIR / "images"))).expanduser()
+
+
+def pick_image(env_name: str, *names: str) -> str:
+    """Use .env path first, otherwise pick the first existing image name."""
+    env_value = os.getenv(env_name, "").strip()
+    if env_value:
+        return str(Path(env_value).expanduser())
+
+    for name in names:
+        candidate = IMAGES_DIR / name
+        if candidate.exists():
+            return str(candidate)
+
+    # Return the preferred name even if it does not exist yet, so the error message is clear.
+    return str(IMAGES_DIR / names[0])
+
+
+IDLE_GIF = pick_image("IDLE_GIF", "ONE.gif", "idle.gif")
+WAKE_GIF = pick_image("WAKE_GIF", "TWO.gif", "wake.gif")
+LISTEN_GIF = pick_image("LISTEN_GIF", "THREE.gif", "listening.gif")
+TALK_GIF = pick_image("TALK_GIF", "FOUR.gif", "talking.gif")
+BYE_GIF = pick_image("BYE_GIF", "dfv.gif", "bye.gif")
 
 UI_IMAGE_PATHS = {
-    "IDLE": str(PROJECT_ROOT / "images" / "ONE.gif"),
-    "WAKE": str(PROJECT_ROOT / "images" / "TWO.gif"),
-    "LISTENING": str(PROJECT_ROOT / "images" / "THREE.gif"),
-    "TALKING": str(PROJECT_ROOT / "images" / "FOUR.gif"),
-    "BYE": str(PROJECT_ROOT / "images" / "dfv.gif"),
+    "IDLE": IDLE_GIF,
+    "WAKE": WAKE_GIF,
+    "LISTENING": LISTEN_GIF,
+    "TALKING": TALK_GIF,
+    "BYE": BYE_GIF,
 }
 
 DEFAULT_DAILY_WORDS: List[Tuple[str, str, str]] = [
@@ -154,11 +232,17 @@ class UIController:
         self._started = False
         self._console_lock = threading.Lock()
 
+    @staticmethod
+    def is_windows_safe() -> bool:
+        return platform.system().lower() == "windows"
+
     def start(self) -> None:
         if self._started:
             return
 
         self._started = True
+
+        print(f"[UI] Images directory: {IMAGES_DIR}")
 
         if not self.enabled:
             print("[UI] GUI is disabled or tkinter is not available. Using terminal fallback.")
@@ -246,7 +330,7 @@ class UIController:
             print(f"[UI] No URL found inside {shortcut_path}")
             return None
 
-        cache_dir = PROJECT_ROOT / "images" / ".cache"
+        cache_dir = IMAGES_DIR / ".cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         target_path = cache_dir / f"{state.lower()}.gif"
 
@@ -309,6 +393,11 @@ class UIController:
         return None
 
     def _run_gui(self) -> None:
+        # When running from SSH on Raspberry Pi Desktop, DISPLAY is sometimes missing.
+        # :0 is the local screen session. If no desktop is running, GUI will fall back to terminal.
+        if not self.is_windows_safe() and not os.environ.get("DISPLAY"):
+            os.environ["DISPLAY"] = ":0"
+
         try:
             root = tk.Tk()
         except Exception as exc:
@@ -628,6 +717,11 @@ class EnglishTutor:
 
         self.ui = UIController()
 
+        self._playback_proc: Optional[subprocess.Popen] = None
+        self._playback_lock = threading.Lock()
+        self._interrupt_event = threading.Event()
+        self.last_speech_interrupted = False
+
     # ---------- General helpers ----------
     @staticmethod
     def run_command(args: List[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -646,12 +740,33 @@ class EnglishTutor:
         return platform.system().lower() == "windows"
 
     def require_api_key(self) -> None:
-        global HF_API_KEY
-        if not HF_API_KEY:
-            load_dotenv(ENV_PATH, override=False)
-            HF_API_KEY = os.getenv("HF_API_KEY")
+        global HF_API_KEY, OPENAI_API_KEY, OPENAI_BASE, OPENAI_MODEL
+        global TTS_MODEL, TTS_VOICE, TTS_SPEED
+
+        # Reload .env here too, because on Windows VS Code sometimes runs the file
+        # from a different working directory than expected.
+        load_environment(override=False)
+
+        HF_API_KEY = os.getenv("HF_API_KEY")
+        OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+        OPENAI_BASE = os.getenv("OPENAI_BASE", "https://api.openai.com")
+        OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+        TTS_MODEL = os.getenv("TTS_MODEL", "tts-1")
+        TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
+        TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0"))
+
         if not HF_API_KEY and not OPENAI_API_KEY:
-            raise RuntimeError("HF_API_KEY or OPENAI_API_KEY is missing. Add it to your .env file.")
+            searched = [
+                str(SCRIPT_DIR / ".env"),
+                str(PROJECT_ROOT / ".env"),
+                str(Path.cwd() / ".env"),
+                str(Path.cwd() / "test" / ".env"),
+            ]
+            raise RuntimeError(
+                "HF_API_KEY or OPENAI_API_KEY is missing. "
+                "Put .env beside testo_final.py or set ENV_PATH. "
+                f"Searched: {searched}"
+            )
 
     def check_audio_tools(self) -> None:
         if self.is_windows():
@@ -995,50 +1110,140 @@ Only output the JSON array, nothing else.
             print("Daily words generation error:", exc)
             return []
 
-    # ---------- Playback ----------
-    def play_audio(self, file_path: str) -> None:
+    # ---------- Playback / Barge-in ----------
+    def stop_current_speech(self) -> None:
+        """Stop the currently playing robot voice immediately."""
+        self.last_speech_interrupted = True
+        self._interrupt_event.set()
+        self.ui.clear_text()
+
+        with self._playback_lock:
+            proc = self._playback_proc
+            if proc and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=0.5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+    def _start_barge_in_monitor(self) -> Optional[Tuple[threading.Event, threading.Thread]]:
+        """Listen in the background while the robot is speaking.
+
+        If the microphone hears a strong new voice signal, stop playback.
+        This requires sounddevice + numpy. If they are not installed, the robot
+        still works normally, just without interruption.
+        """
+        if not BARGE_IN_ENABLED or sd is None or np is None:
+            return None
+
+        stop_event = threading.Event()
+        self._interrupt_event.clear()
+        self.last_speech_interrupted = False
+
+        def monitor() -> None:
+            try:
+                time.sleep(BARGE_IN_GRACE_SECONDS)
+                block_frames = max(256, int(self.input_sample_rate * BARGE_IN_BLOCK_SECONDS))
+
+                if self.is_windows():
+                    stream_kwargs = {
+                        "samplerate": self.input_sample_rate,
+                        "channels": self.input_channels,
+                        "dtype": "int16",
+                        "blocksize": block_frames,
+                    }
+                else:
+                    self.apply_audio_routing()
+                    stream_kwargs = {
+                        "samplerate": self.input_sample_rate,
+                        "channels": self.input_channels,
+                        "dtype": "int16",
+                        "blocksize": block_frames,
+                    }
+
+                with sd.InputStream(**stream_kwargs) as stream:
+                    while not stop_event.is_set() and not self._interrupt_event.is_set():
+                        data, _ = stream.read(block_frames)
+                        rms = float((data.astype("float32") ** 2).mean() ** 0.5)
+                        if rms >= BARGE_IN_RMS_THRESHOLD:
+                            print(f"\n[BARGE-IN] User interruption detected. RMS={rms:.2f}")
+                            self.stop_current_speech()
+                            break
+            except Exception as exc:
+                print(f"[BARGE-IN] Monitor disabled: {exc}")
+
+        thread = threading.Thread(target=monitor, daemon=True)
+        thread.start()
+        return stop_event, thread
+
+    def _run_audio_process(self, cmd: List[str], env: dict, interruptible: bool = True) -> bool:
+        """Run an audio player and optionally stop it when barge-in happens."""
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+            with self._playback_lock:
+                self._playback_proc = proc
+
+            while proc.poll() is None:
+                if interruptible and self._interrupt_event.is_set():
+                    try:
+                        proc.terminate()
+                        proc.wait(timeout=0.5)
+                    except Exception:
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                    return False
+                time.sleep(0.05)
+
+            return True
+        finally:
+            with self._playback_lock:
+                self._playback_proc = None
+
+    def play_audio(self, file_path: str, interruptible: bool = True) -> bool:
         self.apply_audio_routing()
         system = platform.system().lower()
         env = os.environ.copy()
 
-        if system == "windows" and playsound:
-            try:
-                playsound(file_path)
-                return
-            except Exception:
-                pass
-
+        # For Raspberry Pi/Linux, subprocess players are best because we can stop them.
         if self.command_exists("mpg123"):
-            try:
-                subprocess.run(
-                    ["mpg123", "-q", file_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True,
-                    env=env,
-                )
-                return
-            except Exception:
-                pass
+            return self._run_audio_process(["mpg123", "-q", file_path], env, interruptible=interruptible)
 
         if self.command_exists("ffplay"):
+            return self._run_audio_process(
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file_path],
+                env,
+                interruptible=interruptible,
+            )
+
+        # Windows fallback: playsound/os.startfile cannot be interrupted.
+        # For real barge-in on Windows, install FFmpeg and make sure ffplay is in PATH.
+        if system == "windows" and playsound:
             try:
-                subprocess.run(
-                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True,
-                    env=env,
-                )
-                return
+                if interruptible:
+                    print("[AUDIO] Windows fallback is not interruptible. Install FFmpeg/ffplay for barge-in.")
+                playsound(file_path)
+                return True
             except Exception:
                 pass
 
         if system == "windows":
+            if interruptible:
+                print("[AUDIO] os.startfile playback is not interruptible. Install FFmpeg/ffplay for barge-in.")
             os.startfile(file_path)  # type: ignore[attr-defined]
-            return
+            return True
 
         print("Could not find an mp3 player. Install 'mpg123' or 'ffmpeg'.")
+        return False
 
     # ---------- Transcription ----------
     def transcribe_audio(self, file_path: str) -> str:
@@ -1114,6 +1319,7 @@ Always continue the conversation after correction.
 Explain meaning simply in Arabic when needed.
 
 Rules:
+Answer in maximum 2 short sentences.
 Keep replies short and fun
 Be like a friendly tutor, not an examiner
 Mix teaching + chatting
@@ -1165,7 +1371,7 @@ Student said: "{user_text}"
                     "model": model,
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.3,
-                    "max_tokens": 300,
+                    "max_tokens": 120,
                 },
                 timeout=60,
             )
@@ -1185,61 +1391,69 @@ Student said: "{user_text}"
         self.ui.set_state(visual_state)
         self.ui.show_bot_text(text, blocking=False)
 
-        if OPENAI_API_KEY:
-            try:
-                resp = requests.post(
-                    f"{OPENAI_BASE}/v1/audio/speech",
-                    headers={
-                        "Authorization": f"Bearer {OPENAI_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": TTS_MODEL,
-                        "input": text,
-                        "voice": TTS_VOICE,
-                        "response_format": "mp3",
-                        "speed": TTS_SPEED,
-                    },
-                    stream=True,
-                    timeout=120,
-                )
-                if resp.status_code == 200:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-                        for chunk in resp.iter_content(chunk_size=8192):
-                            if chunk:
-                                tmp.write(chunk)
-                        output = tmp.name
-
-                    self.play_audio(output)
-
-                    try:
-                        os.remove(output)
-                    except OSError:
-                        pass
-
-                    time.sleep(0.3)
-                    return
-                else:
-                    print(f"TTS API {resp.status_code}: {resp.text[:200]}")
-            except Exception as exc:
-                print(f"TTS network error: {exc}")
+        barge_monitor = self._start_barge_in_monitor()
 
         try:
-            tts = gTTS(text=text, lang=lang)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-                output = tmp.name
+            if OPENAI_API_KEY:
+                try:
+                    resp = requests.post(
+                        f"{OPENAI_BASE}/v1/audio/speech",
+                        headers={
+                            "Authorization": f"Bearer {OPENAI_API_KEY}",
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "model": TTS_MODEL,
+                            "input": text,
+                            "voice": TTS_VOICE,
+                            "response_format": "mp3",
+                            "speed": TTS_SPEED,
+                        },
+                        stream=True,
+                        timeout=120,
+                    )
+                    if resp.status_code == 200:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+                            for chunk in resp.iter_content(chunk_size=8192):
+                                if chunk:
+                                    tmp.write(chunk)
+                            output = tmp.name
 
-            tts.save(output)
-            self.play_audio(output)
+                        self.play_audio(output, interruptible=True)
+
+                        try:
+                            os.remove(output)
+                        except OSError:
+                            pass
+
+                        time.sleep(0.15)
+                        return
+                    else:
+                        print(f"TTS API {resp.status_code}: {resp.text[:200]}")
+                except Exception as exc:
+                    print(f"TTS network error: {exc}")
 
             try:
-                os.remove(output)
-            except OSError:
-                pass
+                tts = gTTS(text=text, lang=lang)
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+                    output = tmp.name
 
-            time.sleep(0.5)
-        except Exception as exc:
-            print(f"TTS Error ({lang}):", exc)
+                tts.save(output)
+                self.play_audio(output, interruptible=True)
+
+                try:
+                    os.remove(output)
+                except OSError:
+                    pass
+
+                time.sleep(0.2)
+            except Exception as exc:
+                print(f"TTS Error ({lang}):", exc)
+        finally:
+            if barge_monitor:
+                stop_event, thread = barge_monitor
+                stop_event.set()
+                thread.join(timeout=0.2)
 
     # ---------- Spelling ----------
     def check_spelling(self, text: str) -> List[Tuple[str, str]]:
@@ -1397,6 +1611,7 @@ Student said: "{user_text}"
 
         self.ui.start()
         self.ui.set_state("IDLE")
+
         self.speak(f"Hello! I am stitch, your English learning robot. Say '{self.wake_word}' to start.")
         self.ui.set_state("IDLE")
 

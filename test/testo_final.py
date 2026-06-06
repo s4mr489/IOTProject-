@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import array
+import base64
+import difflib
 import json
 import os
 import platform
@@ -9,10 +11,12 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import wave
+import pygame
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
@@ -53,6 +57,17 @@ try:
 except Exception:
     sd = None
 
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
+try:
+    # Optional, Windows only. It lets us list DirectShow camera names like "HP Webcam".
+    from pygrabber.dshow_graph import FilterGraph
+except Exception:
+    FilterGraph = None
+
 
 # ---------------------------------------------------------------
 # Configuration
@@ -77,7 +92,7 @@ HF_ROUTER = "https://router.huggingface.co/hf-inference/models"
 SAMPLE_RATE = 48_000
 MIC_CHANNELS = 1
 HISTORY_LIMIT = 15
-WAKE_WORD = os.getenv("WAKE_WORD", "stitch").lower()
+WAKE_WORD = os.getenv("WAKE_WORD", "kano").lower()
 STOP_PHRASES = tuple(
     w.strip().lower()
     for w in os.getenv("STOP_PHRASES", "good bye,goodbye,good-bye").split(",")
@@ -85,14 +100,97 @@ STOP_PHRASES = tuple(
 )
 DB_PATH = Path(os.getenv("DB_PATH", str(PROJECT_ROOT / "history.db"))).expanduser()
 
+
+def _camera_env_bool(name: str, default: bool = True) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _camera_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _camera_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+# Camera / scan settings
+CAMERA_ENABLED = _camera_env_bool("CAMERA_ENABLED", True)
+CAMERA_INDEX = _camera_env_int("CAMERA_INDEX", 0)
+# Optional: choose the Windows webcam by name instead of guessing CAMERA_INDEX.
+# Example in .env: CAMERA_NAME=HP
+CAMERA_NAME = os.getenv("CAMERA_NAME", "").strip()
+CAMERA_WIDTH = _camera_env_int("CAMERA_WIDTH", 640)
+CAMERA_HEIGHT = _camera_env_int("CAMERA_HEIGHT", 480)
+CAMERA_WARMUP_SECONDS = _camera_env_float("CAMERA_WARMUP_SECONDS", 0.7)
+CAMERA_DIR = Path(os.getenv("CAMERA_DIR", str(SCRIPT_DIR / "camera_captures"))).expanduser()
+CAMERA_COMMANDS = tuple(
+    command.strip().lower()
+    for command in os.getenv(
+        "CAMERA_COMMANDS",
+        "scan,analyze,detect,camera,look,what is this,what do you see,افحص,حلل,شوف,شنو هذا,ما هذا",
+    ).split(",")
+    if command.strip()
+)
+CAMERA_NEGATIVE_COMMANDS = tuple(
+    phrase.strip().lower()
+    for phrase in os.getenv(
+        "CAMERA_NEGATIVE_COMMANDS",
+        "don't scan,dont scan,do not scan,no scan,not scan,stop scan,don't analyze,dont analyze,do not analyze,no camera,don't use camera,dont use camera,لا تفحص,لا تحلل,لا تصور,لا تستخدم الكاميرا,بدون كاميرا",
+    ).split(",")
+    if phrase.strip()
+)
+CAMERA_FUZZY_ENABLED = _camera_env_bool("CAMERA_FUZZY_ENABLED", True)
+VISION_MODEL = os.getenv("VISION_MODEL", OPENAI_MODEL)
+HF_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "google/vit-base-patch16-224")
+VISION_IMAGE_DETAIL = os.getenv("VISION_IMAGE_DETAIL", "auto").strip().lower()
+if VISION_IMAGE_DETAIL not in {"low", "high", "auto"}:
+    VISION_IMAGE_DETAIL = "auto"
+
+VISION_PROMPT = os.getenv("VISION_PROMPT", "").strip() or """
+You are Stitch, a small helpful camera robot.
+
+Analyze the camera image carefully and identify the object or objects.
+Always try to describe what is visible and give your best object guess.
+
+Output format must be exactly:
+
+العربي:
+- الشيء الرئيسي: ...
+- التفاصيل: ...
+- أشياء أخرى: ...
+
+English:
+- Main object: ...
+- Details: ...
+- Other objects: ...
+
+Rules:
+- Explain in Arabic first, then English.
+- Keep the answer short, clear, and useful.
+- Mention colors, shape, and important visible details when helpful.
+- Do not add warnings about the photo conditions.
+- If you are not fully sure, still give your best guess.
+- If no object can be identified at all, say that you cannot identify a specific object, without saying why.
+""".strip()
+
 WAKE_RECORD_SECONDS = 2.0
 TURN_RECORD_SECONDS = 6.0
+MIN_CONFIDENCE_RMS = 900  # require stronger audio for confident speech recognition
 
 # ---------------------------------------------------------------
 # UI configuration
 # ضع مسارات صورك هنا أو داخل ملف .env
 # مثال:
-# IDLE_GIF=/home/stitch/Robot/assets/idle.gif
+# IDLE_GIF=/home/kano/Robot/assets/idle.gif
 # ---------------------------------------------------------------
 UI_ENABLED = os.getenv("UI_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
 UI_FULLSCREEN = os.getenv("UI_FULLSCREEN", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -100,8 +198,8 @@ USER_WORD_DELAY_SECONDS = float(os.getenv("USER_WORD_DELAY_SECONDS", "0.22"))
 BOT_WORD_DELAY_SECONDS = float(os.getenv("BOT_WORD_DELAY_SECONDS", "0.26"))
 
 # The final Raspberry Pi structure should be:
-# /home/stitch/Robot/test/testo_final.py
-# /home/stitch/Robot/test/images/
+# /home/kano/Robot/test/testo_final.py
+# /home/kano/Robot/test/images/
 IMAGES_DIR = Path(os.getenv("IMAGES_DIR", str(SCRIPT_DIR / "images"))).expanduser()
 
 
@@ -134,13 +232,6 @@ UI_IMAGE_PATHS = {
     "BYE": BYE_GIF,
 }
 
-DEFAULT_DAILY_WORDS: List[Tuple[str, str, str]] = [
-    ("adapt", "يتأقلم", "I adapt quickly to new teams."),
-    ("confident", "واثق", "She feels confident about the exam."),
-    ("gather", "يجمع", "Let's gather ideas before we start."),
-    ("improve", "يحسّن", "Daily practice will improve your accent."),
-    ("remind", "يذكّر", "Please remind me about the meeting."),
-]
 
 
 # ---------------------------------------------------------------
@@ -349,7 +440,7 @@ class UIController:
             self.enabled = False
             return
 
-        root.title("Stitch English Tutor")
+        root.title("Kano English Tutor")
         root.configure(bg="#050505")
 
         if self.fullscreen:
@@ -486,7 +577,7 @@ class UIController:
             word_token += 1
             token = word_token
 
-            speaker = "You said" if who == "USER" else "Stitch says"
+            speaker = "You said" if who == "USER" else "Kano says"
             speaker_label.configure(text=speaker)
             caption_label.configure(text="")
 
@@ -547,7 +638,7 @@ class HistoryRepository:
         self.db_path = db_path
         self.limit = limit
         self._ensure_table()
-        self._ensure_daily_table()
+        
 
     def _ensure_table(self) -> None:
         conn = sqlite3.connect(self.db_path)
@@ -565,53 +656,6 @@ class HistoryRepository:
                 """
             )
             conn.commit()
-        finally:
-            conn.close()
-
-    def _ensure_daily_table(self) -> None:
-        conn = sqlite3.connect(self.db_path)
-        try:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS daily_sets (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    ts DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    words_json TEXT NOT NULL
-                )
-                """
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    def save_daily_words(self, words: List[Tuple[str, str, str]]) -> None:
-        payload = json.dumps(words, ensure_ascii=False)
-        conn = sqlite3.connect(self.db_path)
-        try:
-            conn.execute("INSERT INTO daily_sets (words_json) VALUES (?)", (payload,))
-            conn.commit()
-            conn.execute(
-                """
-                DELETE FROM daily_sets
-                WHERE id NOT IN (SELECT id FROM daily_sets ORDER BY id DESC LIMIT 10)
-                """
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-    def latest_daily_words(self) -> List[Tuple[str, str, str]]:
-        conn = sqlite3.connect(self.db_path)
-        try:
-            cur = conn.execute("SELECT words_json FROM daily_sets ORDER BY id DESC LIMIT 1")
-            row = cur.fetchone()
-            if not row:
-                return []
-            try:
-                data = json.loads(row[0])
-                return [(str(w), str(t), str(s)) for w, t, s in data]
-            except Exception:
-                return []
         finally:
             conn.close()
 
@@ -652,14 +696,23 @@ class EnglishTutor:
         self.history = HistoryRepository(DB_PATH)
         self.spellchecker = SpellChecker(language="en") if SpellChecker else None
         self.stop_phrases = STOP_PHRASES
-        self.daily_words: List[Tuple[str, str, str]] = []
 
         self.source_name: str = ""
         self.sink_name: str = ""
         self.input_sample_rate: int = SAMPLE_RATE
         self.input_channels: int = MIC_CHANNELS
+        self.camera_dir = CAMERA_DIR
 
         self.ui = UIController()
+        # interruptible audio
+        self.audio_playing = False
+        self.audio_stop_requested = False
+        self.interrupt_requested = False
+        self.audio_lock = threading.Lock()
+
+        # recent conversation history to keep responses aligned with user intent
+        self.conversation_history: List[Tuple[str, str]] = []
+        self.max_history_turns = 4
 
     # ---------- General helpers ----------
     @staticmethod
@@ -673,6 +726,24 @@ class EnglishTutor:
     @staticmethod
     def command_exists(name: str) -> bool:
         return shutil.which(name) is not None
+
+    def add_conversation_turn(self, role: str, text: str) -> None:
+        text = text.strip()
+        if not text:
+            return
+        self.conversation_history.append((role, text))
+        if len(self.conversation_history) > self.max_history_turns * 2:
+            self.conversation_history = self.conversation_history[- self.max_history_turns * 2 :]
+
+    def build_history_context(self) -> str:
+        if not self.conversation_history:
+            return ""
+
+        lines = []
+        for role, text in self.conversation_history:
+            prefix = "User:" if role == "user" else "Assistant:"
+            lines.append(f"{prefix} {text}")
+        return "\n".join(lines)
 
     @staticmethod
     def is_windows() -> bool:
@@ -958,6 +1029,308 @@ class EnglishTutor:
             except OSError:
                 pass
 
+    # ---------- Camera / object scanning ----------
+    @staticmethod
+    def _text_tokens(text: str) -> List[str]:
+        return re.findall(r"[a-z0-9]+", text.lower())
+
+    def is_camera_negative_request(self, text: str) -> bool:
+        """Return True when the user explicitly says not to scan/use the camera."""
+        if not text:
+            return False
+
+        text_lower = text.lower().strip()
+        normalized = " ".join(self._normalize(text_lower).split())
+        compact_text = "".join(normalized.split())
+
+        for phrase in CAMERA_NEGATIVE_COMMANDS:
+            phrase_lower = phrase.lower().strip()
+            phrase_norm = " ".join(self._normalize(phrase_lower).split())
+            phrase_compact = "".join(phrase_norm.split())
+
+            if phrase_lower and phrase_lower in text_lower:
+                return True
+            if phrase_norm and phrase_norm in normalized:
+                return True
+            if phrase_compact and phrase_compact in compact_text:
+                return True
+
+        negative_words = {"no", "not", "dont", "don't", "do", "stop", "without", "never"}
+        scan_words = {"scan", "scanning", "analyze", "analyse", "detect", "camera"}
+        tokens = self._text_tokens(text_lower)
+        for i, token in enumerate(tokens):
+            if token in scan_words:
+                window = tokens[max(0, i - 4): i + 1]
+                if any(word in window for word in negative_words):
+                    return True
+
+        return False
+
+    def is_camera_scan_request(self, text: str) -> bool:
+        """Return True only when the spoken text clearly asks Kano to scan/analyze."""
+        if not text:
+            return False
+
+        if self.is_camera_negative_request(text):
+            print("[CAMERA] Negative scan command detected. Scan ignored.")
+            return False
+
+        text_lower = text.lower().strip()
+        normalized = " ".join(self._normalize(text_lower).split())
+        compact_text = "".join(normalized.split())
+        tokens = normalized.split()
+
+        for command in CAMERA_COMMANDS:
+            command_lower = command.lower().strip()
+            command_norm = " ".join(self._normalize(command_lower).split())
+            command_compact = "".join(command_norm.split())
+
+            if not command_norm:
+                continue
+
+            if command_lower and command_lower in text_lower:
+                return True
+            if command_norm and command_norm in normalized:
+                return True
+            if command_compact and len(command_compact) >= 5 and command_compact in compact_text:
+                return True
+
+            if CAMERA_FUZZY_ENABLED and " " not in command_norm and len(command_norm) >= 4:
+                for token in tokens:
+                    if len(token) < 4:
+                        continue
+                    if abs(len(token) - len(command_norm)) > 1:
+                        continue
+
+                    ratio = difflib.SequenceMatcher(None, token, command_norm).ratio()
+                    if ratio >= 0.88:
+                        return True
+
+        return False
+
+    @staticmethod
+    def windows_camera_names() -> List[str]:
+        """Return DirectShow camera names on Windows when pygrabber is installed."""
+        if platform.system().lower() != "windows" or FilterGraph is None:
+            return []
+
+        try:
+            graph = FilterGraph()
+            devices = graph.get_input_devices()
+            return [str(device) for device in devices]
+        except Exception as exc:
+            print(f"[CAMERA] Could not list camera names with pygrabber: {exc}")
+            return []
+
+    def resolve_camera_index(self) -> int:
+        """Select the camera. CAMERA_NAME has priority over CAMERA_INDEX on Windows."""
+        if self.is_windows() and CAMERA_NAME:
+            wanted = CAMERA_NAME.lower()
+            devices = self.windows_camera_names()
+
+            if devices:
+                print("[CAMERA] Available cameras:")
+                for idx, name in enumerate(devices):
+                    marker = "  <== selected" if wanted in name.lower() else ""
+                    print(f"  {idx}: {name}{marker}")
+
+                for idx, name in enumerate(devices):
+                    if wanted in name.lower():
+                        print(f"[CAMERA] Selected by CAMERA_NAME='{CAMERA_NAME}': index {idx} ({name})")
+                        return idx
+
+                print(
+                    f"[CAMERA] No camera name contains '{CAMERA_NAME}'. "
+                    f"Falling back to CAMERA_INDEX={CAMERA_INDEX}."
+                )
+            else:
+                print(
+                    "[CAMERA] CAMERA_NAME is set but camera names could not be listed. "
+                    "Install pygrabber or use CAMERA_INDEX. "
+                    "Command: python -m pip install pygrabber comtypes"
+                )
+
+        return CAMERA_INDEX
+
+    def capture_camera_frame(self) -> Path:
+        if not CAMERA_ENABLED:
+            raise RuntimeError("Camera scanning is disabled. Set CAMERA_ENABLED=1 in .env.")
+
+        if cv2 is None:
+            raise RuntimeError(
+                "OpenCV is not installed. Install it with: "
+                "python -m pip install opencv-python"
+            )
+
+        self.camera_dir.mkdir(parents=True, exist_ok=True)
+
+        camera_index = self.resolve_camera_index()
+
+        if self.is_windows():
+            cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(camera_index)
+
+        if not cap.isOpened():
+            raise RuntimeError(
+                f"Could not open camera index {camera_index}. "
+                "Try CAMERA_NAME=HP, or run --camera-test and set CAMERA_INDEX=1 or CAMERA_INDEX=2 in .env."
+            )
+
+        try:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+
+            start_time = time.time()
+            frame = None
+            ok = False
+
+            while time.time() - start_time < CAMERA_WARMUP_SECONDS:
+                ok, frame = cap.read()
+                time.sleep(0.05)
+
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                raise RuntimeError("Camera opened but no frame was captured.")
+
+            image_path = self.camera_dir / f"scan_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+            success = cv2.imwrite(str(image_path), frame)
+
+            if not success or not image_path.exists():
+                raise RuntimeError("Failed to save camera capture.")
+
+            print(f"[CAMERA] Saved frame: {image_path}")
+            return image_path
+        finally:
+            cap.release()
+
+    @staticmethod
+    def encode_image_base64(image_path: Path) -> str:
+        return base64.b64encode(image_path.read_bytes()).decode("utf-8")
+
+    def analyze_camera_image_openai(self, image_path: Path, user_text: str = "") -> str:
+        if not OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY is missing. Vision scan needs OpenAI key.")
+
+        image_base64 = self.encode_image_base64(image_path)
+        prompt = VISION_PROMPT
+        if user_text:
+            prompt += f'\n\nUser command: "{user_text}"'
+
+        response = requests.post(
+            f"{OPENAI_BASE}/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": VISION_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{image_base64}",
+                                    "detail": VISION_IMAGE_DETAIL,
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "temperature": 0.2,
+                "max_tokens": 300,
+            },
+            timeout=90,
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(f"Vision API error {response.status_code}: {response.text[:500]}")
+
+        data = response.json()
+        return data["choices"][0]["message"]["content"].strip()
+
+    def analyze_camera_image_hf(self, image_path: Path) -> str:
+        if not HF_API_KEY:
+            raise RuntimeError("HF_API_KEY is missing.")
+
+        headers = {
+            "Authorization": f"Bearer {HF_API_KEY}",
+            "Accept": "application/json",
+            "Content-Type": "image/jpeg",
+        }
+
+        response = requests.post(
+            f"{HF_ROUTER}/{HF_IMAGE_MODEL}",
+            headers=headers,
+            data=image_path.read_bytes(),
+            timeout=90,
+        )
+
+        if response.status_code != 200:
+            raise RuntimeError(f"Hugging Face vision error {response.status_code}: {response.text[:500]}")
+
+        data = response.json()
+        if not isinstance(data, list) or not data:
+            return (
+                "العربي:\n"
+                "- لا أستطيع تحديد شيء معيّن من الصورة.\n\n"
+                "English:\n"
+                "- I cannot identify a specific object from the image."
+            )
+
+        labels = []
+        for item in data[:5]:
+            label = str(item.get("label", "unknown"))
+            score = float(item.get("score", 0.0))
+            labels.append(f"{label} ({score:.0%})")
+
+        main_label = labels[0] if labels else "unknown"
+        other_labels = ", ".join(labels[1:]) if len(labels) > 1 else "لا يوجد / none"
+
+        return (
+            "العربي:\n"
+            f"- الشيء الرئيسي: {main_label}\n"
+            "- التفاصيل: هذا أفضل تخمين من نموذج Hugging Face.\n"
+            f"- أشياء أخرى: {other_labels}\n\n"
+            "English:\n"
+            f"- Main object: {main_label}\n"
+            "- Details: This is the best guess from the Hugging Face model.\n"
+            f"- Other objects: {other_labels}"
+        )
+
+    def analyze_camera_image(self, image_path: Path, user_text: str = "") -> str:
+        if OPENAI_API_KEY:
+            return self.analyze_camera_image_openai(image_path, user_text)
+
+        if HF_API_KEY:
+            return self.analyze_camera_image_hf(image_path)
+
+        raise RuntimeError("OPENAI_API_KEY or HF_API_KEY is missing. Add it to your .env file.")
+
+    def handle_camera_scan_request(self, user_text: str = "") -> None:
+        """Capture one camera frame, analyze it, then speak the result."""
+        try:
+            self.ui.set_state("LISTENING")
+            if user_text:
+                self.ui.show_user_text(user_text, blocking=False)
+
+            self.speak("Okay! I will scan what is in front of me.", lang="en", visual_state="WAKE")
+
+            image_path = self.capture_camera_frame()
+            result = self.analyze_camera_image(image_path, user_text=user_text)
+
+            print("\n[CAMERA RESULT]\n", result, "\n")
+            self.speak(result, lang=None, visual_state="TALKING")
+
+        except Exception as exc:
+            error_message = f"Camera scan error: {exc}"
+            print(error_message)
+            self.speak(error_message, lang=None, visual_state="TALKING")
+
+
     # ---------- Daily words helpers ----------
     @staticmethod
     def _normalize(text: str) -> str:
@@ -1030,48 +1403,165 @@ Only output the JSON array, nothing else.
 
     # ---------- Playback ----------
     def play_audio(self, file_path: str) -> None:
-        self.apply_audio_routing()
-        system = platform.system().lower()
-        env = os.environ.copy()
+        try:
+            with self.audio_lock:
+                self.audio_playing = True
+                self.audio_stop_requested = False
+                self.interrupt_requested = False
 
-        if system == "windows" and playsound:
-            try:
-                playsound(file_path)
-                return
-            except Exception:
-                pass
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
 
-        if self.command_exists("mpg123"):
-            try:
-                subprocess.run(
-                    ["mpg123", "-q", file_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True,
-                    env=env,
-                )
-                return
-            except Exception:
-                pass
+            monitor_thread = None
+            if sd is not None:
+                monitor_thread = threading.Thread(target=self._monitor_interrupt, daemon=True)
+                monitor_thread.start()
 
-        if self.command_exists("ffplay"):
-            try:
-                subprocess.run(
-                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file_path],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=True,
-                    env=env,
-                )
-                return
-            except Exception:
-                pass
+            pygame.mixer.music.load(file_path)
+            pygame.mixer.music.play()
 
-        if system == "windows":
-            os.startfile(file_path)  # type: ignore[attr-defined]
+            while True:
+                with self.audio_lock:
+                    if self.audio_stop_requested:
+                        pygame.mixer.music.stop()
+                        break
+
+                if not pygame.mixer.music.get_busy():
+                    break
+
+                time.sleep(0.05)
+
+            if monitor_thread is not None:
+                monitor_thread.join(timeout=0.1)
+
+        except Exception as exc:
+            print(f"Audio error: {exc}")
+
+        finally:
+            with self.audio_lock:
+                self.audio_playing = False
+
+    def stop_audio(self) -> None:
+        with self.audio_lock:
+            self.audio_stop_requested = True
+
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
+        except Exception:
+            pass
+
+    def _audio_is_loud(self, frames: object) -> bool:
+        try:
+            if np is not None:
+                peak = float(np.max(np.abs(frames)))
+            else:
+                peak = 0.0
+                for frame in frames:
+                    if isinstance(frame, (list, tuple)):
+                        for sample in frame:
+                            peak = max(peak, abs(sample))
+                    else:
+                        peak = max(peak, abs(frame))
+            return peak >= 2000
+        except Exception:
+            return False
+
+    def _monitor_interrupt(self) -> None:
+        if sd is None:
             return
 
-        print("Could not find an mp3 player. Install 'mpg123' or 'ffmpeg'.")
+        try:
+            with sd.InputStream(samplerate=self.input_sample_rate, channels=self.input_channels, dtype="int16") as stream:
+                while self.audio_playing:
+                    with self.audio_lock:
+                        if self.audio_stop_requested:
+                            break
+
+                    frames, overflowed = stream.read(int(self.input_sample_rate * 0.2))
+                    if overflowed:
+                        continue
+
+                    if self._audio_is_loud(frames):
+                        with self.audio_lock:
+                            self.audio_stop_requested = True
+                        self.interrupt_requested = True
+                        break
+        except Exception as exc:
+            print(f"Audio interrupt monitor error: {exc}")
+
+    def _handle_interrupt(self) -> bool:
+        self.stop_audio()
+        self.interrupt_requested = False
+        print("\n[Interrupt] User started speaking. Listening now...")
+        self.ui.set_state("LISTENING")
+
+        audio_path = ""
+        try:
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            temp_file.close()
+            audio_path = temp_file.name
+            self.pw_record(3.0, audio_path)
+            user_text = self.transcribe_audio(audio_path).strip()
+            print("Interrupted input:", user_text)
+            self.ui.show_user_text(user_text, blocking=True)
+            return self._process_user_text(user_text)
+        except Exception as exc:
+            print(f"Interrupt handling error: {exc}")
+            return True
+        finally:
+            if audio_path and os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                except OSError:
+                    pass
+
+    def _process_user_text(self, user_text: str) -> bool:
+        self.add_conversation_turn("user", user_text)
+
+        if not user_text:
+            self.speak("I did not hear anything. Please try again.")
+            return True
+
+        if self.is_camera_negative_request(user_text):
+            self.speak("Okay, I will not scan.", lang="en")
+            return True
+
+        if self.is_camera_scan_request(user_text):
+            self.handle_camera_scan_request(user_text)
+            return True
+
+        if self.should_end_conversation(user_text):
+            farewell = "Goodbye! Returning to wake mode."
+            print("\nRobot says:\n", farewell, "\n")
+            self.ui.set_state("BYE")
+            self.ui.show_bot_text(farewell, blocking=False)
+            time.sleep(0.7)
+            self.ui.set_state("IDLE")
+            return False
+
+       
+        spelling = self.check_spelling(user_text)
+
+        spelling_msg = ""
+        if spelling:
+            parts = [f"'{w}' should be spelled '{c}'" for w, c in spelling]
+            spelling_msg = "I noticed spelling issues: " + "; ".join(parts)
+            feedback_parts = [part.strip() for part in (spelling_msg.strip(),) if part.strip()]
+        else:
+            feedback_parts = []
+
+        ai_response = self.ask_ai(user_text)
+        if feedback_parts:
+            combined_response = f"{ai_response}\n\n{' '.join(feedback_parts)}"
+        else:
+            combined_response = ai_response
+
+        self.speak(combined_response, lang=None)
+        self.add_conversation_turn("assistant", combined_response)
+
+        return True
 
     # ---------- Transcription ----------
     def transcribe_audio(self, file_path: str) -> str:
@@ -1123,36 +1613,63 @@ Only output the JSON array, nothing else.
 
         return ""
 
+    @staticmethod
+    def compute_audio_rms(file_path: str) -> float:
+        try:
+            with wave.open(file_path, "rb") as wf:
+                frames = wf.readframes(wf.getnframes())
+                if not frames:
+                    return 0.0
+                samples = array.array("h", frames)
+                if not samples:
+                    return 0.0
+                mean_sq = sum(float(s) * float(s) for s in samples) / len(samples)
+                return mean_sq ** 0.5
+        except Exception:
+            return 0.0
+
+    def is_low_confidence_audio(self, audio_path: str, transcript: str) -> bool:
+        rms = self.compute_audio_rms(audio_path)
+        if rms < MIN_CONFIDENCE_RMS:
+            print(f"Low confidence audio: RMS={rms:.1f}")
+            return True
+        if len(transcript.split()) <= 2 and rms < MIN_CONFIDENCE_RMS * 1.15:
+            print(f"Low confidence short phrase: RMS={rms:.1f}, words={len(transcript.split())}")
+            return True
+        return False
+
     # ---------- Prompt ----------
     def build_prompt(self, user_text: str) -> str:
-        daily_block = ""
-        if self.daily_words:
-            lines = [f"- {w} (translation: {t})" for w, t, _ in self.daily_words]
-            daily_block = (
-                "\nDaily words to reinforce; weave at least two naturally and invite the learner to use them:\n"
-                + "\n".join(lines)
-            )
+        history_block = ""
+        if self.conversation_history:
+            history_block = "Conversation history:\n" + self.build_history_context() + "\n\n"
 
         return f"""
-You are a friendly English teacher like Duolingo.
+{history_block}You are Kano, an intelligent English teacher and language-learning assistant.
 
 Your job:
-Teach English in a fun, conversational way.
-Keep the conversation natural, friendly, and engaging.
+Help the learner understand English clearly.
+Focus on accuracy, meaning, grammar, pronunciation, and natural usage.
+Use the student's exact words as the starting point.
 If the student makes mistakes:
-Gently correct ONLY the important mistake
-Show the correct sentence in a simple way
-Do NOT over-explain grammar
-Always continue the conversation after correction.
-Explain meaning simply in Arabic when needed.
+Correct the most important issue clearly.
+Show the improved phrasing and explain why when it helps understanding.
+Do not over-explain grammar unless the correction would otherwise be confusing.
+If the student asks for translation, provide the literal meaning plus the intended meaning, context, tone, and possible interpretations.
+When the user asks about a word, phrase, or expression, also provide alternative ways to say it in English, common synonyms, a natural example sentence, and whether it is formal, informal, or slang.
+If the student speaks English, listen for pronunciation issues and correct them gently with short guidance on stress or common mistakes.
+If slang, idioms, or cultural references appear, explain them clearly and note how meaning can change with context.
+For Arabic input, especially Iraqi Arabic, favor everyday Iraqi usage and dialect meaning before assuming standard Arabic.
+If a phrase has more than one likely meaning, explain the most likely interpretation and mention helpful alternatives.
+Offer relevant vocabulary, grammar, pronunciation, or usage notes when helpful.
 
 Rules:
-Keep replies short and fun
-Be like a friendly tutor, not an examiner
-Mix teaching + chatting
-speak in a playful alien-like tone use short excited sentences slightly childish and curious reactions in a pitch tone
+Be polite, concise, and helpful.
+Prioritize teaching, accuracy, and useful explanations over small talk.
+Avoid canned, repetitive phrases and do not invent details that the user did not mention.
+Ask a brief clarifying question when the sentence is unclear.
+Keep the response grounded in what the user actually said.
 Student said: "{user_text}"
-{daily_block}
 """.strip()
 
     @staticmethod
@@ -1168,20 +1685,25 @@ Student said: "{user_text}"
         prompt = self.build_prompt(user_text)
 
         if is_arabic:
-            daily = ""
-            if self.daily_words:
-                daily = "الكلمات اليومية: " + ", ".join(w for w, _, _ in self.daily_words)
             prompt = f"""
-أنت مدرس إنجليزي ممتع مثل Duolingo.
+أنت كانو، مدرس إنجليزي ذكي ومساعد لتعلم اللغة.
 
-المهام:
-تعلّم الإنجليزية بشكل محادثة ممتعة
-إذا يوجد خطأ: صححه بلطف بدون شرح طويل، أعطِ الجملة الصحيحة فقط
-خلّي المحادثة مستمرة مثل صديق
-اشرح المعنى بالعربي إذا يحتاج
+المهمة:
+ساعد المتعلم على فهم اللغة الإنجليزية بوضوح.
+ركز على المعنى، القواعد، الاستخدام الطبيعي، والنطق.
+استخدم كلمات الطالب الفعلية كأساس ولا تفترض معلومات غير واردة.
+إذا طلب الطالب ترجمة، قدم المعنى الحرفي وأيضًا السياق والنبرة والتفسيرات الممكنة.
+إذا وردت عامية أو تعابير مجازية أو إشارات ثقافية، فسّرها بوضوح واذكر كيف يتغير المعنى مع السياق.
+فضل المعنى العراقي العامي والألفاظ اليومية قبل المعنى الفصيح عندما يتطلب السياق ذلك.
+إذا كانت العبارة غير واضحة أو يمكن أن تُفهم بأكثر من معنى، اذكر التفسير الأكثر احتمالاً ثم البدائل المفيدة.
+قدم ملاحظات مفيدة عن المفردات، القواعد، النطق، أو الاستخدام الطبيعي عندما يكون ذلك مناسبًا.
 
+القواعد:
+كن مهذبًا وواضحًا.
+أولية الشرح تكون للتعلم والدقة.
+تجنب العبارات الجاهزة المتكررة ولا تخترع تفاصيل غير واردة.
+اسأل سؤالًا موجزًا لتوضيح المعنى إذا كان غير واضح.
 رسالة الطالب: "{user_text}"
-{daily}
 """.strip()
 
         if not OPENAI_API_KEY:
@@ -1245,6 +1767,9 @@ Student said: "{user_text}"
 
                     self.play_audio(output)
 
+                    if self.interrupt_requested:
+                        self._handle_interrupt()
+
                     try:
                         os.remove(output)
                     except OSError:
@@ -1264,6 +1789,9 @@ Student said: "{user_text}"
 
             tts.save(output)
             self.play_audio(output)
+
+            if self.interrupt_requested:
+                self._handle_interrupt()
 
             try:
                 os.remove(output)
@@ -1289,14 +1817,6 @@ Student said: "{user_text}"
                 corrections.append((wrong, suggestion))
 
         return corrections
-
-    # ---------- Voice ----------
-    @staticmethod
-    def is_active_voice(text: str) -> bool:
-        passive_pattern = re.compile(r"\b(am|is|are|was|were|be|been|being)\b\s+\w+ed\b", re.IGNORECASE)
-        if passive_pattern.search(text) and " by " in text.lower():
-            return False
-        return True
 
     # ---------- Wake word ----------
     def listen_for_wake_word(self) -> None:
@@ -1356,64 +1876,30 @@ Student said: "{user_text}"
         print("You said:", user_text)
         self.ui.show_user_text(user_text, blocking=True)
 
+        if not user_text:
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+            self.speak("I did not hear anything. Please try again.")
+            return True
+
+        if self.is_low_confidence_audio(audio_path, user_text):
+            try:
+                os.remove(audio_path)
+            except OSError:
+                pass
+            self.speak(
+                "The recording was too quiet or unclear. Please speak more clearly and closer to the microphone."
+            )
+            return True
+
         try:
             os.remove(audio_path)
         except OSError:
             pass
 
-        if not user_text:
-            self.speak("I did not hear anything. Please try again.")
-            return True
-
-        if self.should_end_conversation(user_text):
-            farewell = "Goodbye! Returning to wake mode."
-            print("\nRobot says:\n", farewell, "\n")
-            self.ui.set_state("BYE")
-            self.ui.show_bot_text(farewell, blocking=False)
-            time.sleep(0.7)
-            self.ui.set_state("IDLE")
-            return False
-
-        if self.detect_daily_request(user_text):
-            words = self.generate_daily_words()
-            if not words:
-                words = self.history.latest_daily_words()
-            if not words:
-                words = DEFAULT_DAILY_WORDS
-                self.history.save_daily_words(words)
-
-            self.daily_words = words
-            lines = [f"{idx+1}) {w} — {t} — {s}" for idx, (w, t, s) in enumerate(words)]
-            msg = "Here are your 5 words for today:\n" + "\n".join(lines) + "\nTry to use them now!"
-            self.speak(msg, lang=None)
-            return True
-
-        spelling = self.check_spelling(user_text)
-        active = self.is_active_voice(user_text)
-
-        spelling_msg = ""
-        if spelling:
-            parts = [f"'{w}' should be spelled '{c}'" for w, c in spelling]
-            spelling_msg = " I noticed spelling issues: " + "; ".join(parts)
-
-        voice_msg = "" if active else "Try rewriting it in active voice."
-
-        ai_response = self.ask_ai(user_text)
-        feedback_parts = [part.strip() for part in (voice_msg, spelling_msg.strip()) if part.strip()]
-        if feedback_parts:
-            combined_response = f"{ai_response}\n\n{' '.join(feedback_parts)}"
-        else:
-            combined_response = ai_response
-        self.speak(combined_response, lang=None)
-
-        self.history.add_record(
-            sentence=user_text,
-            corrected=ai_response,
-            misspellings=spelling,
-            is_active_voice=active,
-        )
-
-        return True
+        return self._process_user_text(user_text)
 
     def run_conversation(self) -> None:
         self.speak("I'm listening. Say 'good bye' when you want to stop.")
@@ -1431,15 +1917,125 @@ Student said: "{user_text}"
         self.choose_audio_devices()
         self.mic_level_check()
 
-        self.speak(f"Hello! I am stitch, your English learning robot. Say '{self.wake_word}' to start.")
+        self.speak(f"Hello! I am Kano, your English teacher and language guide. Say '{self.wake_word}' to start.")
         self.ui.set_state("IDLE")
+        threading.Thread(target=self.listen_loop, daemon=True).start()
 
         while True:
             self.listen_for_wake_word()
             self.run_conversation()
+    def listen_loop(self):
+        while True:
+            time.sleep(0.1)
+
+
+
+def list_cameras_tool(max_index: int = 10) -> None:
+    """Print camera names and indexes when possible."""
+    print("[CAMERA LIST]")
+
+    if cv2 is None:
+        print("OpenCV is not installed. Run: python -m pip install opencv-python")
+        return
+
+    names: List[str] = []
+    if platform.system().lower() == "windows" and FilterGraph is not None:
+        try:
+            graph = FilterGraph()
+            names = [str(device) for device in graph.get_input_devices()]
+        except Exception as exc:
+            print(f"Could not list DirectShow names: {exc}")
+
+    if names:
+        for index, name in enumerate(names):
+            print(f"{index}: {name}")
+        print("\nPut this in .env to choose the HP camera by name:")
+        print("CAMERA_NAME=HP")
+        print("Or set CAMERA_INDEX to the shown number.")
+        return
+
+    print("Camera names are not available. Install pygrabber:")
+    print("python -m pip install pygrabber comtypes")
+    print("\nTesting camera indexes instead...")
+
+    for index in range(max_index):
+        if platform.system().lower() == "windows":
+            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(index)
+        opened = bool(cap.isOpened())
+        cap.release()
+        print(f"{index}: {'available' if opened else 'not available'}")
+
+
+def camera_test_tool(max_index: int = 10) -> None:
+    """Save one image from each camera index so you can choose the right camera."""
+    if cv2 is None:
+        print("OpenCV is not installed. Run: python -m pip install opencv-python")
+        return
+
+    out_dir = SCRIPT_DIR / "camera_test"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[CAMERA TEST] Saving previews to: {out_dir}")
+
+    names: List[str] = []
+    if platform.system().lower() == "windows" and FilterGraph is not None:
+        try:
+            graph = FilterGraph()
+            names = [str(device) for device in graph.get_input_devices()]
+            print("[CAMERA TEST] DirectShow camera names:")
+            for idx, name in enumerate(names):
+                print(f"  {idx}: {name}")
+        except Exception as exc:
+            print(f"[CAMERA TEST] Could not list camera names: {exc}")
+
+    for index in range(max_index):
+        if platform.system().lower() == "windows":
+            cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        else:
+            cap = cv2.VideoCapture(index)
+
+        name = names[index] if index < len(names) else f"camera_{index}"
+        safe_name = re.sub(r"[^a-zA-Z0-9_-]+", "_", name).strip("_")[:60] or f"camera_{index}"
+
+        if not cap.isOpened():
+            print(f"Camera index {index}: not available ({name})")
+            continue
+
+        try:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            time.sleep(0.7)
+
+            frame = None
+            ok = False
+            for _ in range(5):
+                ok, frame = cap.read()
+                time.sleep(0.05)
+
+            if ok and frame is not None:
+                path = out_dir / f"camera_index_{index}_{safe_name}.jpg"
+                cv2.imwrite(str(path), frame)
+                print(f"Camera index {index}: OK ({name}) -> {path}")
+            else:
+                print(f"Camera index {index}: opened but no frame ({name})")
+        finally:
+            cap.release()
+
+    print("\nOpen the saved JPG files.")
+    print("If the HP image is camera_index_1_..., put CAMERA_INDEX=1 in .env.")
+    print("If pygrabber shows the name, you can also put CAMERA_NAME=HP in .env.")
 
 
 def main() -> None:
+    if "--list-cameras" in sys.argv:
+        list_cameras_tool()
+        return
+
+    if "--camera-test" in sys.argv:
+        camera_test_tool()
+        return
+
     try:
         EnglishTutor().run()
     except KeyboardInterrupt:
